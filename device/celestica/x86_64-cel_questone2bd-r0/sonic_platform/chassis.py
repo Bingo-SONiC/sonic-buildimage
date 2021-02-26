@@ -9,11 +9,12 @@
 #############################################################################
 
 try:
-    import sys
-    import re
-    import os
-    import subprocess
     import json
+    import os
+    import re
+    import sys
+    import subprocess
+    import time
     from sonic_platform_base.chassis_base import ChassisBase
     from helper import APIHelper
 except ImportError as e:
@@ -25,10 +26,15 @@ NUM_PSU = 2
 NUM_THERMAL = 11
 NUM_SFP = 56
 NUM_COMPONENT = 7
+
+SFP_PORT_START = 1
+SFP_PORT_END = 48
+QSFP_PORT_START = 49
+QSFP_PORT_END = 56
+
 REBOOT_CAUSE_REG = "0xA106"
 TLV_EEPROM_I2C_BUS = 0
 TLV_EEPROM_I2C_ADDR = 56
-
 BASE_CPLD_PLATFORM = "questone2bd.cpldb"
 BASE_GETREG_PATH = "/sys/devices/platform/{}/getreg".format(BASE_CPLD_PLATFORM)
 
@@ -40,11 +46,12 @@ class Chassis(ChassisBase):
         ChassisBase.__init__(self)
         self._api_helper = APIHelper()
         self.sfp_module_initialized = False
+        self.fan_module_initialized = False
+        self.__initialize_eeprom()
 
         if not self._api_helper.is_host():
             self.__initialize_fan()
             self.__initialize_psu()
-            self.__initialize_eeprom()
             self.__initialize_thermals()
         else:
             self.__initialize_components()
@@ -68,6 +75,7 @@ class Chassis(ChassisBase):
             for fan_index in range(0, NUM_FAN):
                 fan = Fan(fant_index, fan_index)
                 self._fan_list.append(fan)
+        self.fan_module_initialized = True
 
     def __initialize_thermals(self):
         from sonic_platform.thermal import Thermal
@@ -122,33 +130,19 @@ class Chassis(ChassisBase):
             is "REBOOT_CAUSE_HARDWARE_OTHER", the second string can be used
             to pass a description of the reboot cause.
         """
-
-        raw_cause = self._api_helper.get_register_value(
+        hx_cause = self._api_helper.get_register_value(
             BASE_GETREG_PATH, REBOOT_CAUSE_REG)
-        hx_cause = raw_cause.lower()
-        reboot_cause = {
-            "0x00": self.REBOOT_CAUSE_HARDWARE_OTHER,
-            "0x11": self.REBOOT_CAUSE_POWER_LOSS,
-            "0x22": self.REBOOT_CAUSE_NON_HARDWARE,
-            "0x33": self.REBOOT_CAUSE_HARDWARE_OTHER,
-            "0x44": self.REBOOT_CAUSE_NON_HARDWARE,
-            "0x55": self.REBOOT_CAUSE_NON_HARDWARE,
-            "0x66": self.REBOOT_CAUSE_WATCHDOG,
-            "0x77": self.REBOOT_CAUSE_NON_HARDWARE
-        }.get(hx_cause, self.REBOOT_CAUSE_HARDWARE_OTHER)
 
-        description = {
-            "0x00": "Unknown reason",
-            "0x11": "The last reset is Power on reset",
-            "0x22": "The last reset is soft-set CPU warm reset",
-            "0x33": "The last reset is soft-set CPU cold reset",
-            "0x44": "The last reset is CPU warm reset",
-            "0x55": "The last reset is CPU cold reset",
-            "0x66": "The last reset is watchdog reset",
-            "0x77": "The last reset is power cycle reset"
-        }.get(hx_cause, "Unknown reason")
-
-        return (reboot_cause, description)
+        return {
+            "0x00": (self.REBOOT_CAUSE_HARDWARE_OTHER, 'Unknown'),
+            "0x11": (self.REBOOT_CAUSE_POWER_LOSS, 'The last reset is Power on reset'),
+            "0x22": (self.REBOOT_CAUSE_HARDWARE_OTHER, 'The last reset is soft-set CPU warm reset'),
+            "0x33": (self.REBOOT_CAUSE_HARDWARE_OTHER, 'The last reset is soft-set CPU cold reset'),
+            "0x44": (self.REBOOT_CAUSE_HARDWARE_OTHER, 'The last reset is CPU warm reset'),
+            "0x55": (self.REBOOT_CAUSE_HARDWARE_OTHER, 'The last reset is CPU cold reset'),
+            "0x66": (self.REBOOT_CAUSE_WATCHDOG, 'The last reset is watchdog reset'),
+            "0x77": (self.REBOOT_CAUSE_HARDWARE_OTHER, 'The last reset is power cycle reset'),
+        }.get(hx_cause.lower(), (self.REBOOT_CAUSE_HARDWARE_OTHER, 'Unknown'))
 
     ##############################################################
     ######################## SFP methods #########################
@@ -260,3 +254,90 @@ class Chassis(ChassisBase):
             A boolean value, True if device is operating properly, False if not
         """
         return True
+
+    ##############################################################
+    ###################### Event methods #########################
+    ##############################################################
+
+    def get_change_event(self, timeout=0):
+        """
+        Returns a nested dictionary containing all devices which have
+        experienced a change at chassis level
+
+        Args:
+            timeout: Timeout in milliseconds (optional). If timeout == 0,
+                this method will block until a change is detected.
+
+        Returns:
+            (bool, dict):
+                - bool: True if call successful, False if not;
+                - dict: A nested dictionary where key is a device type,
+                        value is a dictionary with key:value pairs in the format of
+                        {'device_id':'device_event'}, where device_id is the device ID
+                        for this device and device_event.
+                        The known devices's device_id and device_event was defined as table below.
+                         -----------------------------------------------------------------
+                         device   |     device_id       |  device_event  |  annotate
+                         -----------------------------------------------------------------
+                         'fan'          '<fan number>'     '0'              Fan removed
+                                                           '1'              Fan inserted
+
+                         'sfp'          '<sfp number>'     '0'              Sfp removed
+                                                           '1'              Sfp inserted
+                                                           '2'              I2C bus stuck
+                                                           '3'              Bad eeprom
+                                                           '4'              Unsupported cable
+                                                           '5'              High Temperature
+                                                           '6'              Bad cable
+
+                         'voltage'      '<monitor point>'  '0'              Vout normal
+                                                           '1'              Vout abnormal
+                         --------------------------------------------------------------------
+                  Ex. {'fan':{'0':'0', '2':'1'}, 'sfp':{'11':'0', '12':'1'},
+                       'voltage':{'U20':'0', 'U21':'1'}}
+                  Indicates that:
+                     fan 0 has been removed, fan 2 has been inserted.
+                     sfp 11 has been removed, sfp 12 has been inserted.
+                     monitored voltage U20 became normal, voltage U21 became abnormal.
+                  Note: For sfp, when event 3-6 happened, the module will not be avalaible,
+                        XCVRD shall stop to read eeprom before SFP recovered from error status.
+        """
+        from sonic_platform.event import FanEvent, SfpEvent, VoltageEvent, POLL_INTERVAL
+
+        if not self.fan_module_initialized:
+            self.__initialize_fan()
+
+        if not self.sfp_module_initialized:
+            self.__initialize_sfp()
+
+        fan_event = FanEvent(self._fan_list)
+        sfp_event = SfpEvent(self._sfp_list)
+        voltage_event = VoltageEvent()
+
+        cur_fan_state = fan_event.get_fan_state()
+        cur_volt_state = voltage_event.get_voltage_state()
+        start_milli_time = int(round(time.time() * 1000))
+        int_sfp, int_fan, int_volt = {}, {}, {}
+
+        sleep_time = min(
+            timeout, POLL_INTERVAL) if timeout != 0 else POLL_INTERVAL
+        while True:
+            chk_sfp = sfp_event.check_all_port_interrupt_event()
+            int_sfp = sfp_event.update_port_event_object(
+                chk_sfp, int_sfp) if chk_sfp else int_sfp
+            int_fan = fan_event.check_fan_status(cur_fan_state, int_fan)
+            int_volt = voltage_event.check_voltage_status(cur_volt_state, int_volt)
+
+            current_milli_time = int(round(time.time() * 1000))
+            if (int_sfp or int_fan or int_volt) or \
+                    (timeout != 0 and current_milli_time - start_milli_time > timeout):
+                break
+
+            time.sleep(sleep_time)
+
+        change_dict = dict()
+        change_dict['fan'] = int_fan
+        change_dict['sfp'] = int_sfp
+        change_dict['voltage'] = int_volt
+
+        return True, change_dict
